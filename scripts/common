@@ -101,7 +101,35 @@ on_chroot() {
 		mount -t tmpfs  tmpfs "${ROOTFS_DIR}/tmp"
 	fi
 
+	# Setup DNS resolution for chroot environment
+	local resolv_conf_backup=""
+	if [ -f "${ROOTFS_DIR}/etc/resolv.conf" ]; then
+		resolv_conf_backup="${ROOTFS_DIR}/etc/resolv.conf.pigen-backup"
+		cp "${ROOTFS_DIR}/etc/resolv.conf" "$resolv_conf_backup"
+	fi
+	
+	# Copy host DNS configuration to chroot
+	if [ -f "/etc/resolv.conf" ]; then
+		cp "/etc/resolv.conf" "${ROOTFS_DIR}/etc/resolv.conf"
+	else
+		# Fallback DNS configuration if host resolv.conf is missing
+		cat > "${ROOTFS_DIR}/etc/resolv.conf" << 'EOF'
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+nameserver 208.67.222.222
+EOF
+	fi
+
+	# Execute the chroot command
 	capsh $CAPSH_ARG "--chroot=${ROOTFS_DIR}/" -- -e "$@"
+	
+	# Restore original resolv.conf if it existed
+	if [ -f "$resolv_conf_backup" ]; then
+		mv "$resolv_conf_backup" "${ROOTFS_DIR}/etc/resolv.conf"
+	elif [ ! -f "${ROOTFS_DIR}/etc/resolv.conf.original" ]; then
+		# Remove the temporary resolv.conf if there was no original
+		rm -f "${ROOTFS_DIR}/etc/resolv.conf"
+	fi
 }
 export -f on_chroot
 

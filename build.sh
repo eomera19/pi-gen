@@ -74,9 +74,134 @@ EOF
 			on_chroot < ${i}-run-chroot.sh
 			log "End ${SUB_STAGE_DIR}/${i}-run-chroot.sh"
 		fi
+		
 	done
+	
+	# Copy validation files if they exist (after all steps complete)
+	if [ -d "${VALIDATION_STEPS_DIR_NAME}" ] && [ -n "${FIRST_USER_NAME:-}" ]; then
+		log "Copying validation files from ${SUB_STAGE_DIR}/${VALIDATION_STEPS_DIR_NAME}"
+		copy_validation_files "${SUB_STAGE_DIR}" "validation" "${STAGE}"
+	fi
+	
+	# Run build-time validations if they exist (after all steps complete)
+	if [ -d "${VALIDATION_STEPS_DIR_NAME}" ]; then
+		log "Running build-time validations for ${SUB_STAGE_DIR}"
+		run_build_time_validations "${SUB_STAGE_DIR}"
+	fi
+	
 	popd > /dev/null
 	log "End ${SUB_STAGE_DIR}"
+}
+
+# Copy validation files from a step to the user's home directory
+copy_validation_files() {
+	local step_dir="$1"
+	local step_name="$2"
+	local stage_name="$3"
+	
+	# Only copy if we have a user and rootfs
+	if [ -z "${FIRST_USER_NAME:-}" ] || [ -z "${ROOTFS_DIR:-}" ]; then
+		return
+	fi
+	
+	local user_home="${ROOTFS_DIR}/home/${FIRST_USER_NAME}"
+	local validation_source="${step_dir}/${VALIDATION_STEPS_DIR_NAME}"
+	local validation_dest="${user_home}/${VALIDATION_STEPS_DIR_NAME}/${stage_name}/${step_name}/${VALIDATION_STEPS_DIR_NAME}"
+	
+	# Only proceed if source validation directory exists
+	if [ ! -d "${validation_source}" ]; then
+		return
+	fi
+	
+	# Create destination directory structure
+	mkdir -p "${validation_dest}"
+	
+	# Install validation files with proper permissions
+	local install_opts=""
+	if [ -n "${FIRST_USER_ID:-}" ]; then
+		install_opts="-o ${FIRST_USER_ID} -g ${FIRST_USER_ID}"
+	fi
+	
+	# Install each file in the validation source directory
+	find "${validation_source}" -type f -name "*.sh" -exec install -m 755 ${install_opts} {} "${validation_dest}/" \;
+	find "${validation_source}" -type f ! -name "*.sh" -exec install -m 644 ${install_opts} {} "${validation_dest}" \;
+	
+	log "Validation files installed: ${stage_name}/${step_name} -> ${validation_dest}"
+}
+
+# Run build-time validations for a step (excludes runtime validations)
+run_build_time_validations() {
+	local step_dir="$1"
+	local validation_source="${step_dir}/${VALIDATION_STEPS_DIR_NAME}"
+	
+	# Only proceed if source validation directory exists
+	if [ ! -d "${validation_source}" ]; then
+		return
+	fi
+	
+	# Check if we have the validation system available
+	if [ ! -f "${SCRIPT_DIR}/validate-system.sh" ]; then
+		log "Validation system not found - skipping build-time validations"
+		return
+	fi
+	
+	local has_validations=false
+	local validation_count=0
+	local passed_validations=0
+	
+	# Set up environment for build-time validation
+	export ROOTFS_DIR="${ROOTFS_DIR}"
+	export STAGE_NAME="${STAGE}"
+	export IMG_NAME="${IMG_NAME:-raspios}"
+	
+	# Run each non-runtime validation script
+	for validation_file in "${validation_source}"/*.sh; do
+		if [ -f "${validation_file}" ]; then
+			local validation_name=$(basename "${validation_file}" .sh)
+			
+			# Skip runtime validations during build
+			if [[ "$validation_name" == *"_runtime" ]]; then
+				log "Skipping runtime validation during build: ${validation_name}"
+				continue
+			fi
+			
+			has_validations=true
+			validation_count=$((validation_count + 1))
+			
+			log "Running build-time validation: ${validation_name}"
+			
+			# Make sure the validation script is executable
+			chmod +x "${validation_file}"
+			
+			# Run the validation script in a subshell to isolate environment
+			if (
+				cd "${validation_source}"
+				# Set up minimal environment for validation
+				export PATH="${PATH}:${SCRIPT_DIR}"
+				source "${SCRIPT_DIR}/validation-framework.sh"
+				
+				# Run the validation
+				bash "${validation_file}"
+			); then
+				log "✅ Build validation passed: ${validation_name}"
+				passed_validations=$((passed_validations + 1))
+			else
+				log "❌ Build validation failed: ${validation_name}"
+				# Note: We don't fail the build on validation errors
+				# This allows the build to continue but alerts to issues
+			fi
+		fi
+	done
+	
+	if [ "$has_validations" = true ]; then
+		log "Build-time validation summary: ${passed_validations}/${validation_count} passed"
+		if [ $passed_validations -eq $validation_count ]; then
+			log "✅ All build-time validations passed for $(basename "$step_dir")"
+		else
+			log "⚠️  Some build-time validations failed for $(basename "$step_dir") - check above"
+			exit 1
+		fi
+	fi
 }
 
 
@@ -184,7 +309,7 @@ export IMG_DATE="${IMG_DATE:-"$(date +%Y-%m-%d)"}"
 export IMG_FILENAME="${IMG_FILENAME:-"${IMG_DATE}-${IMG_NAME}"}"
 export ARCHIVE_FILENAME="${ARCHIVE_FILENAME:-"image_${IMG_DATE}-${IMG_NAME}"}"
 
-export SCRIPT_DIR="${BASE_DIR}/scripts"
+SCRIPT_DIR="${BASE_DIR}/scripts"
 export WORK_DIR="${WORK_DIR:-"${BASE_DIR}/work/${IMG_NAME}"}"
 export DEPLOY_DIR=${DEPLOY_DIR:-"${BASE_DIR}/deploy"}
 
@@ -242,6 +367,11 @@ export QUILT_NO_DIFF_INDEX=1
 export QUILT_NO_DIFF_TIMESTAMPS=1
 export QUILT_REFRESH_ARGS="-p ab"
 
+# Validation system paths
+export VALIDATION_STEPS_DIR_NAME="validations"
+
+# shellcheck source=scripts/common
+source "${SCRIPT_DIR}/logging.sh"
 # shellcheck source=scripts/common
 source "${SCRIPT_DIR}/common"
 # shellcheck source=scripts/dependencies_check
